@@ -3,11 +3,14 @@ package drive
 import (
 	"context"
 	"fmt"
+	"github.com/ncw/rclone/fs"
+	"github.com/ncw/rclone/fs/fserrors"
+	"github.com/ncw/rclone/lib/pacer"
 	"net/http"
 	"time"
 
+	"github.com/Fionera/plexdrive/config"
 	. "github.com/claudetech/loggo/default"
-	"github.com/dweidenfeld/plexdrive/config"
 	"golang.org/x/oauth2"
 	gdrive "google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
@@ -28,11 +31,13 @@ type Client struct {
 	token           *oauth2.Token
 	config          *oauth2.Config
 	rootNodeID      string
+	teamDriveID     string
 	changesChecking bool
+	pacer           *fs.Pacer
 }
 
 // NewClient creates a new Google Drive client
-func NewClient(config *config.Config, cache *Cache, refreshInterval time.Duration, rootNodeID string) (*Client, error) {
+func NewClient(config *config.Config, cache *Cache, refreshInterval time.Duration, rootNodeID string, teamDriveID string) (*Client, error) {
 	client := Client{
 		cache:   cache,
 		context: context.Background(),
@@ -47,11 +52,24 @@ func NewClient(config *config.Config, cache *Cache, refreshInterval time.Duratio
 			Scopes:      []string{gdrive.DriveScope},
 		},
 		rootNodeID:      rootNodeID,
+		teamDriveID:     teamDriveID,
 		changesChecking: false,
+		pacer: &fs.Pacer{
+			Pacer: pacer.New(
+				pacer.InvokerOption(pacerInvoker),
+				pacer.MaxConnectionsOption(fs.Config.Checkers+fs.Config.Transfers),
+				pacer.RetriesOption(fs.Config.LowLevelRetries),
+				pacer.CalculatorOption(pacer.NewGoogleDrive()),
+			),
+		},
 	}
 
 	if "" == client.rootNodeID {
-		client.rootNodeID = "root"
+		if "" != client.teamDriveID {
+			client.rootNodeID = client.teamDriveID
+		} else {
+			client.rootNodeID = "root"
+		}
 	}
 
 	if err := client.authorize(); nil != err {
@@ -105,9 +123,19 @@ func (d *Client) checkChanges(firstCheck bool) {
 		query := client.Changes.
 			List(pageToken).
 			Fields(googleapi.Field(fmt.Sprintf("nextPageToken, newStartPageToken, changes(removed, fileId, file(%v))", Fields))).
-			PageSize(1000)
+			PageSize(1000).
+			SupportsTeamDrives(d.teamDriveID != "").
+			IncludeTeamDriveItems(d.teamDriveID != "").
+			TeamDriveId(d.teamDriveID)
 
-		results, err := query.Do()
+		var results *gdrive.ChangeList
+		var err error
+		err = d.pacer.Call(func() (bool, error) {
+			results, err = query.Do()
+
+			return shouldRetry(err)
+		})
+
 		if nil != err {
 			Log.Debugf("%v", err)
 			Log.Warningf("Could not get changes")
@@ -123,7 +151,7 @@ func (d *Client) checkChanges(firstCheck bool) {
 					Log.Tracef("%v", err)
 				}
 				deletedItems++
-			} else {
+			} else if change.File != nil {
 				object, err := d.mapFileToObject(change.File)
 				if nil != err {
 					Log.Debugf("%v", err)
@@ -161,6 +189,41 @@ func (d *Client) checkChanges(firstCheck bool) {
 	}
 
 	d.changesChecking = false
+}
+
+func pacerInvoker(try, retries int, f pacer.Paced) (retry bool, err error) {
+	retry, err = f()
+	if retry {
+		Log.Infof("pacer: low level retry %d/%d (error %v)", try, retries, err)
+		err = fserrors.RetryError(err)
+	}
+	return
+}
+
+func shouldRetry(err error) (bool, error) {
+	if err == nil {
+		return false, nil
+	}
+	if fserrors.ShouldRetry(err) {
+		return true, err
+	}
+	switch gerr := err.(type) {
+	case *googleapi.Error:
+		if gerr.Code == 400 { // Retry on Invalid Value
+			return true, err
+		}
+		if gerr.Code >= 500 && gerr.Code < 600 {
+			// All 5xx errors should be retried
+			return true, err
+		}
+		if len(gerr.Errors) > 0 {
+			reason := gerr.Errors[0].Reason
+			if reason == "rateLimitExceeded" || reason == "userRateLimitExceeded" {
+				return true, err
+			}
+		}
+	}
+	return false, err
 }
 
 func (d *Client) authorize() error {
@@ -223,10 +286,18 @@ func (d *Client) GetRoot() (*APIObject, error) {
 		return nil, fmt.Errorf("Could not get Google Drive client")
 	}
 
-	file, err := client.Files.
+	query := client.Files.
 		Get(d.rootNodeID).
 		Fields(googleapi.Field(Fields)).
-		Do()
+		SupportsTeamDrives(d.teamDriveID != "")
+
+	var file *gdrive.File
+	err = d.pacer.Call(func() (bool, error) {
+		file, err = query.Do()
+
+		return shouldRetry(err)
+	})
+
 	if nil != err {
 		Log.Debugf("%v", err)
 		return nil, fmt.Errorf("Could not get object %v from API", d.rootNodeID)
@@ -234,7 +305,7 @@ func (d *Client) GetRoot() (*APIObject, error) {
 
 	// getting file size
 	if file.MimeType != "application/vnd.google-apps.folder" && 0 == file.Size {
-		res, err := client.Files.Get(d.rootNodeID).Download()
+		res, err := client.Files.Get(d.rootNodeID).SupportsTeamDrives(d.teamDriveID != "").Download()
 		if nil != err {
 			Log.Debugf("%v", err)
 			return nil, fmt.Errorf("Could not get file size for object %v", d.rootNodeID)
@@ -275,13 +346,13 @@ func (d *Client) Remove(object *APIObject, parent string) error {
 
 	go func() {
 		if object.CanTrash {
-			if _, err := client.Files.Update(object.ObjectID, &gdrive.File{Trashed: true}).Do(); nil != err {
+			if _, err := client.Files.Update(object.ObjectID, &gdrive.File{Trashed: true}).SupportsTeamDrives(d.teamDriveID != "").Do(); nil != err {
 				Log.Debugf("%v", err)
 				Log.Warningf("Could not delete object %v (%v) from API", object.ObjectID, object.Name)
 				d.cache.UpdateObject(object)
 			}
 		} else {
-			if _, err := client.Files.Update(object.ObjectID, nil).RemoveParents(parent).Do(); nil != err {
+			if _, err := client.Files.Update(object.ObjectID, nil).RemoveParents(parent).SupportsTeamDrives(d.teamDriveID != "").Do(); nil != err {
 				Log.Debugf("%v", err)
 				Log.Warningf("Could not unsubscribe object %v (%v) from API", object.ObjectID, object.Name)
 				d.cache.UpdateObject(object)
@@ -300,13 +371,13 @@ func (d *Client) Mkdir(parent string, Name string) (*APIObject, error) {
 		return nil, fmt.Errorf("Could not get Google Drive client")
 	}
 
-	created, err := client.Files.Create(&gdrive.File{Name: Name, Parents: []string{parent}, MimeType: "application/vnd.google-apps.folder"}).Do()
+	created, err := client.Files.Create(&gdrive.File{Name: Name, Parents: []string{parent}, MimeType: "application/vnd.google-apps.folder"}).SupportsTeamDrives(d.teamDriveID != "").Do()
 	if nil != err {
 		Log.Debugf("%v", err)
 		return nil, fmt.Errorf("Could not create object(%v) from API", Name)
 	}
 
-	file, err := client.Files.Get(created.Id).Fields(googleapi.Field(Fields)).Do()
+	file, err := client.Files.Get(created.Id).Fields(googleapi.Field(Fields)).SupportsTeamDrives(d.teamDriveID != "").Do()
 	if nil != err {
 		Log.Debugf("%v", err)
 		return nil, fmt.Errorf("Could not get object fields %v from API", created.Id)
@@ -334,7 +405,7 @@ func (d *Client) Rename(object *APIObject, OldParent string, NewParent string, N
 		return fmt.Errorf("Could not get Google Drive client")
 	}
 
-	if _, err := client.Files.Update(object.ObjectID, &gdrive.File{Name: NewName}).RemoveParents(OldParent).AddParents(NewParent).Do(); nil != err {
+	if _, err := client.Files.Update(object.ObjectID, &gdrive.File{Name: NewName}).RemoveParents(OldParent).AddParents(NewParent).SupportsTeamDrives(d.teamDriveID != "").Do(); nil != err {
 		Log.Debugf("%v", err)
 		return fmt.Errorf("Could not rename object %v (%v) from API", object.ObjectID, object.Name)
 	}
@@ -374,6 +445,7 @@ func (d *Client) mapFileToObject(file *gdrive.File) (*APIObject, error) {
 
 	return &APIObject{
 		ObjectID:     file.Id,
+		TeamDriveID:  d.teamDriveID,
 		Name:         file.Name,
 		IsDir:        file.MimeType == "application/vnd.google-apps.folder",
 		LastModified: lastModified,

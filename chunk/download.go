@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Fionera/plexdrive/drive"
 	. "github.com/claudetech/loggo/default"
-	"github.com/dweidenfeld/plexdrive/drive"
 )
 
 // Downloader handles concurrent chunk downloads

@@ -30,6 +30,7 @@ var (
 // APIObject is a Google Drive file object
 type APIObject struct {
 	ObjectID     string
+	TeamDriveID  string
 	Name         string
 	IsDir        bool
 	Size         uint64
@@ -134,6 +135,31 @@ func (c *Cache) GetObject(id string) (object *APIObject, err error) {
 
 	Log.Tracef("Got object from cache %v", object)
 	return object, err
+}
+
+func (c *Cache) GetAllObjects() ([]*APIObject, error) {
+
+	objects := make([]*APIObject, 0)
+	c.db.View(func(tx *bolt.Tx) error {
+		cr := tx.Bucket(bParents).Cursor()
+
+		// Iterate over all object ids stored under the parent in the index
+		objectIds := make([]string, 0)
+		for k, v := cr.Seek([]byte("")); k != nil; k, v = cr.Next() {
+			objectIds = append(objectIds, string(v))
+		}
+
+		// Fetch all objects for the given ids
+		for _, id := range objectIds {
+			if object, err := boltGetObject(tx, id); nil == err {
+				objects = append(objects, object)
+			}
+		}
+		return nil
+	})
+
+	Log.Tracef("Got objects from cache %v", objects)
+	return objects, nil
 }
 
 // GetObjectsByParent get all objects under parent id

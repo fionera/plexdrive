@@ -17,12 +17,12 @@ import (
 
 	"runtime"
 
+	"github.com/Fionera/plexdrive/chunk"
+	"github.com/Fionera/plexdrive/config"
+	"github.com/Fionera/plexdrive/drive"
+	"github.com/Fionera/plexdrive/mount"
 	"github.com/claudetech/loggo"
 	. "github.com/claudetech/loggo/default"
-	"github.com/dweidenfeld/plexdrive/chunk"
-	"github.com/dweidenfeld/plexdrive/config"
-	"github.com/dweidenfeld/plexdrive/drive"
-	"github.com/dweidenfeld/plexdrive/mount"
 	flag "github.com/ogier/pflag"
 	"golang.org/x/sys/unix"
 )
@@ -32,20 +32,21 @@ func main() {
 	usr, err := user.Current()
 	home := ""
 	if err != nil {
-	    // Fall back to reading $HOME - work around user.Current() not
-	    // working for cross compiled binaries on OSX or freebsd.
-	    // https://github.com/golang/go/issues/6376
-	    home = os.Getenv("HOME")
-	    if home == "" {
-	    	panic(fmt.Sprintf("Could not read users homedir and HOME is not set: %v\n", err))
-	    }
+		// Fall back to reading $HOME - work around user.Current() not
+		// working for cross compiled binaries on OSX or freebsd.
+		// https://github.com/golang/go/issues/6376
+		home = os.Getenv("HOME")
+		if home == "" {
+			panic(fmt.Sprintf("Could not read users homedir and HOME is not set: %v\n", err))
+		}
 	} else {
-	    home = usr.HomeDir
+		home = usr.HomeDir
 	}
 
 	// parse the command line arguments
 	argLogLevel := flag.IntP("verbosity", "v", 0, "Set the log level (0 = error, 1 = warn, 2 = info, 3 = debug, 4 = trace)")
-	argRootNodeID := flag.String("root-node-id", "root", "The ID of the root node to mount (use this for only mount a sub directory)")
+	argRootNodeID := flag.String("root-node-id", "", "The ID of the root node to mount (use this for only mount a sub directory)")
+	argTeamDriveID := flag.String("team-drive-id", "", "Set the Teamdrive ID")
 	argConfigPath := flag.StringP("config", "c", filepath.Join(home, ".plexdrive"), "The path to the configuration directory")
 	argCacheFile := flag.String("cache-file", filepath.Join(home, ".plexdrive", "cache.bolt"), "Path the the cache file")
 	argChunkSize := flag.String("chunk-size", "10M", "The size of each chunk that is downloaded (units: B, K, M, G)")
@@ -119,6 +120,7 @@ func main() {
 		// debug all given parameters
 		Log.Debugf("verbosity            : %v", logLevel)
 		Log.Debugf("root-node-id         : %v", *argRootNodeID)
+		Log.Debugf("team-drive-id        : %v", *argTeamDriveID)
 		Log.Debugf("config               : %v", *argConfigPath)
 		Log.Debugf("cache-file           : %v", *argCacheFile)
 		Log.Debugf("chunk-size           : %v", *argChunkSize)
@@ -172,7 +174,7 @@ func main() {
 		}
 		defer cache.Close()
 
-		client, err := drive.NewClient(cfg, cache, *argRefreshInterval, *argRootNodeID)
+		client, err := drive.NewClient(cfg, cache, *argRefreshInterval, *argRootNodeID, *argTeamDriveID)
 		if nil != err {
 			Log.Errorf("%v", err)
 			os.Exit(4)
@@ -195,6 +197,23 @@ func main() {
 		if err := mount.Mount(client, chunkManager, argMountPoint, mountOptions, uid, gid, umask); nil != err {
 			Log.Debugf("%v", err)
 			os.Exit(5)
+		}
+	} else if argCommand == "list" {
+		cache, err := drive.NewCache(*argCacheFile, *argConfigPath, *argLogLevel > 3)
+		if nil != err {
+			Log.Errorf("%v", err)
+			os.Exit(4)
+		}
+		defer cache.Close()
+
+		objects, err := cache.GetAllObjects()
+		if nil != err {
+			Log.Errorf("%v", err)
+			os.Exit(4)
+		}
+
+		for _, object := range objects {
+			Log.Info(object.Name + " | " + object.ObjectID)
 		}
 	} else {
 		Log.Errorf("Command %v not found", argCommand)
