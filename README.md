@@ -51,6 +51,8 @@ Usage of ./plexdrive mount:
     	The time to wait till checking for changes (default 1m0s)
   --root-node-id string
     	The ID of the root node to mount (use this for only mount a sub directory) (default "root")
+  --team-drive-id string
+        The ID of the Teamdrive
   --uid int
     	Set the mounts UID (-1 = default permissions) (default -1)
   --umask value
@@ -59,6 +61,11 @@ Usage of ./plexdrive mount:
     	Set the log level (0 = error, 1 = warn, 2 = info, 3 = debug, 4 = trace)
   --version
     	Displays program's version information
+```
+
+```
+Usage of ./plexdrive list:
+    The same as mount
 ```
 
 ### Support 
